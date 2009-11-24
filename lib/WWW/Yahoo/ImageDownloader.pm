@@ -13,6 +13,7 @@ has 'appid' => ( is => 'ro', isa => 'Str', required => 1 );
 has 'dir' => ( is => 'ro', isa => 'Path::Class::Dir', required =>1, coerce => 1 );
 has 'api' => ( is => 'ro', isa => 'WebService::Simple', lazy_build => 1 );
 has 'filter' => ( is => 'rw', isa => 'Str', default => 'no' );
+has 'count' => ( is => 'rw', isa => 'Int', default => 50 );
 
 no Mouse;
 
@@ -24,9 +25,10 @@ sub _build_api {
         params   => {
             appid  => $self->appid,
             filter => $self->filter,
-            count  => 50,
+            count  => $self->count,
         },
         response_parser => $parser,
+        debug => 1,
     );
 }
 
@@ -36,13 +38,14 @@ sub download {
     while (1) {
         my $cv = AnyEvent->condvar;
         $cv->begin;
-        $start = $page * 50;
+        $start = $page * $self->count;
+        warn "start: $start\n";
         my $res =
           $self->api->get( uri_escape_utf8($query), { start => $start } );
         my $ref = $res->parse_response();
         unless ($total_hits) {
             $total_hits = $ref->{ysearchresponse}->{totalhits};
-            warn "total hits: $total_hits";
+            warn "total hits: $total_hits\n";
             sleep(1);
         }
         for my $image ( @{ $ref->{ysearchresponse}->{resultset_images} } ) {
@@ -70,7 +73,9 @@ sub download {
         }
         $cv->end( sub { $cv = undef; } ); $cv->recv;
         $page++;
-        last if ( $total_hits - ( $page * 50 ) < 0 );
+        last
+          if ( $total_hits - ( $page * $self->count ) < 0
+            || $start > ( 1000 - $self->count - 1 ) );
     }
 }
 

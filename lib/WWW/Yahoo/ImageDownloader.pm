@@ -1,9 +1,80 @@
 package WWW::Yahoo::ImageDownloader;
-
-use strict;
-use warnings;
+use Mouse;
 our $VERSION = '0.01';
+use MouseX::Types::Path::Class;
+use AnyEvent;
+use AnyEvent::HTTP;
+use IO::File;
+use URI::Escape qw( uri_escape_utf8 );
+use WebService::Simple;
+use WebService::Simple::Parser::JSON;
 
+has 'appid' => ( is => 'ro', isa => 'Str', required => 1 );
+has 'dir' => ( is => 'ro', isa => 'Path::Class::Dir', required =>1, coerce => 1 );
+has 'api' => ( is => 'ro', isa => 'WebService::Simple', lazy_build => 1 );
+has 'filter' => ( is => 'rw', isa => 'Str', default => 'no' );
+
+no Mouse;
+
+sub _build_api {
+    my $self   = shift;
+    my $parser = WebService::Simple::Parser::JSON->new();
+    return WebService::Simple->new(
+        base_url => 'http://boss.yahooapis.com/ysearch/images/v1/',
+        params   => {
+            appid  => $self->appid,
+            filter => $self->filter,
+            count  => 50,
+        },
+        response_parser => $parser,
+    );
+}
+
+sub download {
+    my ( $self, $query ) = @_;
+    my ( $page, $count, $start, $total_hits ) = ( 0, 1,, );
+    while (1) {
+        my $cv = AnyEvent->condvar;
+        $cv->begin;
+        $start = $page * 50;
+        my $res =
+          $self->api->get( uri_escape_utf8($query), { start => $start } );
+        my $ref = $res->parse_response();
+        unless ($total_hits) {
+            $total_hits = $ref->{ysearchresponse}->{totalhits};
+            warn "total hits: $total_hits";
+            sleep(1);
+        }
+        for my $image ( @{ $ref->{ysearchresponse}->{resultset_images} } ) {
+            my $ext = 'jpg';
+            $ext = $1 if $image->{url} =~ /\.([^\.]+)$/;
+            my $filename =
+              $self->dir->file( sprintf( "%08d\.$ext", $count ) )->stringify;
+            unless ( -f $filename ) {
+                $cv->begin;
+                AnyEvent::HTTP::http_request
+                  GET     => $image->{url},
+                  timeout => 10,
+                  on_body => sub {
+                    my ( $body, $hdr ) = @_;
+                    if ( $hdr->{'content-type'} =~ /image/ ) {
+                        print "$filename : $image->{url}\n";
+                        my $file = IO::File->new( $filename, 'w' );
+                        $file->print($body);
+                        $file->close;
+                    }
+                    $cv->end;
+                  };
+            }
+            $count++;
+        }
+        $cv->end( sub { $cv = undef; } ); $cv->recv;
+        $page++;
+        last if ( $total_hits - ( $page * 50 ) < 0 );
+    }
+}
+
+__PACKAGE__->meta->make_immutable();
 1;
 __END__
 

@@ -5,63 +5,68 @@ use MouseX::Types::Path::Class;
 use AnyEvent;
 use AnyEvent::HTTP;
 use IO::File;
-use URI::Escape qw( uri_escape_utf8 );
-use WebService::Simple;
-use WebService::Simple::Parser::JSON;
+use JSON qw( from_json );
+use URI::Escape qw( uri_unescape uri_escape_utf8 );
+use LWP::UserAgent;
 
-has 'appid' => ( is => 'ro', isa => 'Str', required => 1 );
 has 'dir' => ( is => 'ro', isa => 'Path::Class::Dir', required =>1, coerce => 1 );
-has 'api' => ( is => 'ro', isa => 'WebService::Simple', lazy_build => 1 );
-has 'filter' => ( is => 'rw', isa => 'Str', default => 'no' );
-has 'count' => ( is => 'rw', isa => 'Int', default => 50 );
+has 'count' => ( is => 'ro', isa => 'Int', default => 22 );
+has 'ua' => (
+    is      => 'rw',
+    isa     => 'LWP::UserAgent',
+    default => sub {
+        my $ua = LWP::UserAgent->new();
+        $ua->agent('Mozilla/4.0 (compatible; MSIE 6.0; Windows NT 5.0;)');
+        $ua->cookie_jar( {} );
+        return $ua;
+    }
+);
 
 no Mouse;
 
-sub _build_api {
-    my $self   = shift;
-    my $parser = WebService::Simple::Parser::JSON->new();
-    return WebService::Simple->new(
-        base_url => 'http://boss.yahooapis.com/ysearch/images/v1/',
-        params   => {
-            appid  => $self->appid,
-            filter => $self->filter,
-            count  => $self->count,
-        },
-        response_parser => $parser,
-        debug => 1,
-    );
-}
-
 sub download {
     my ( $self, $query ) = @_;
+
+    my $res = $self->ua->get('http://search.yahoo.com/preferences/preferences?page=filters');
+    my $bcrumb = $1 if $res->content =~ /".bcrumb".*?value="(.+?)"/;
+    $res = $self->ua->get("http://search.yahoo.com/web/validate?pref_done=http%3A%2F%2Fsearch.yahoo.com&.bcrumb=$bcrumb&adult_done=http%3A%2F%2Fsearch.yahoo.com%2Fweb%2Fsavepref&adult_cancel=http%3A%2F%2Fsearch.yahoo.com%2Fpreferences%2Fpreferences%3Fei%3DUTF-8%26page%3Dfilters&vm=p&prev_sBL=Off");
+    my $pref_url = $1 if $res->content =~ /name=accept value="(.+?)"/;
+    $pref_url =~ s/&amp;/&/;
+    $self->ua->get( $pref_url );
+
     my ( $page, $count, $start, $total_hits ) = ( 0, 1,, );
     while (1) {
-        my $cv = AnyEvent->condvar;
-        $cv->begin;
-        $start = $page * $self->count;
-        warn "start: $start\n";
-        my $res =
-          $self->api->get( uri_escape_utf8($query), { start => $start } );
-        my $ref = $res->parse_response();
+        $start = $page * $self->count + 1;
+        $query = uri_escape_utf8( $query );
+        my $url = "http://images.search.yahoo.com/search/images?p=$query&pstart=1&b=$start&xargs=0";
+        warn $url;
+        $res = $self->ua->get( $url );
+        my $content = $res->content();
+        $content =~ /jsonData=(\{"RES":.+?\}\});/;
+        my $ref = from_json( $1 );
         unless ($total_hits) {
-            $total_hits = $ref->{ysearchresponse}->{totalhits};
+            $total_hits = $ref->{META}{tor};
             warn "total hits: $total_hits\n";
             sleep(1);
         }
-        for my $image ( @{ $ref->{ysearchresponse}->{resultset_images} } ) {
+        my $cv = AnyEvent->condvar;
+        $cv->begin;
+        for my $image ( @{$ref->{RES}} ){
+            my $href = uri_unescape( $image->{href} );
+            my $url = 'http://' . uri_unescape($1) if $href =~ /imgurl=([^&].+?)&/;
             my $ext = 'jpg';
-            $ext = $1 if $image->{url} =~ /\.([^\.]+)$/;
+            $ext = $1 if $url =~ /\.([^\.]+)$/;
             my $filename =
               $self->dir->file( sprintf( "%08d\.$ext", $count ) )->stringify;
             unless ( -f $filename ) {
                 $cv->begin;
                 AnyEvent::HTTP::http_request
-                  GET     => $image->{url},
+                  GET     => $url,
                   timeout => 10,
                   on_body => sub {
                     my ( $body, $hdr ) = @_;
                     if ( $hdr->{'content-type'} =~ /image/ ) {
-                        print "$filename : $image->{url}\n";
+                        print "$filename : $url\n";
                         my $file = IO::File->new( $filename, 'w' );
                         $file->print($body);
                         $file->close;
@@ -73,9 +78,7 @@ sub download {
         }
         $cv->end( sub { $cv = undef; } ); $cv->recv;
         $page++;
-        last
-          if ( $total_hits - ( $page * $self->count ) < 0
-            || $start > ( 1000 - $self->count - 1 ) );
+        last if ( $total_hits - $start - $self->count < 0 );
     }
 }
 
